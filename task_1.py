@@ -11,6 +11,7 @@ import subprocess
 
 
 def host_ping(addresses_lst):
+    result = []
     for address in addresses_lst:
         try:
             try:
@@ -19,17 +20,25 @@ def host_ping(addresses_lst):
                 try:
                     ip = socket.gethostbyname(address)
                 except socket.gaierror as err:
-                    print(f'Возникла ошибка: {err}')
+                    result.append(('Узел недоступен', str(address), 'Не определен'))
+                    # print(f'Возникла ошибка: {err}')
                     continue
 
             ping = subprocess.call(['ping', address], stdout=open(os.devnull, 'w'))
             if ping == 0:
-                print(f"Узел {ip} доступен")
+                result.append(('Узел доступен', str(address), f'{ip}'))
+                # print(f"Узел {ip} доступен")
             else:
-                print(f'Узел {ip} недоступен')
+                result.append(('Узел недоступен', str(address), f'{ip}'))
+                # print(f'Узел {ip} недоступен')
         except ValueError as err:
-            print(f'Возникла ошибка: {err}')
+            result.append(('Узел недоступен', str(address), 'Не определен'))
+            # print(f'Возникла ошибка: {err}')
+
+    return result
 
 
 if __name__ == '__main__':
-    host_ping(['127.0.0.1', 'google.r;u', 'google.com', '1.1.1.1'])
+    res = host_ping(['127.0.0.1', 'google.r;u', 'google.com', '1.1.1.1'])
+    for el in res:
+        print(f'{el[0]}, адрес: {el[1]}, ip: {el[2]}')

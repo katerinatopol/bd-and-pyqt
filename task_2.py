@@ -11,10 +11,15 @@ def host_range_ping(range_cidr):
     try:
         net = ipaddress.ip_network(range_cidr)
         hosts = list(map(str, net.hosts()))
-        host_ping(hosts)
+        res = host_ping(hosts)
     except ValueError as err:
         print(f'Возникла ошибка: {err}')
         return
 
+    return res
 
-host_range_ping('127.0.0.0/24')
+
+if __name__ == '__main__':
+    res = host_range_ping('127.0.0.0/30')
+    for el in res:
+        print(f'{el[0]}, адрес: {el[1]}, ip: {el[2]}')
