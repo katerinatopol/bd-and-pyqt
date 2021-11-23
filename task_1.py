@@ -31,4 +31,5 @@ def host_ping(addresses_lst):
             print(f'Возникла ошибка: {err}')
 
 
-host_ping(['127.0.0.1', 'google.r;u', 'google.com', '1.1.1.1'])
+if __name__ == '__main__':
+    host_ping(['127.0.0.1', 'google.r;u', 'google.com', '1.1.1.1'])
