@@ -13,6 +13,31 @@ class IncorrectData(Exception):
         return 'Получены некорректные данные'
 
 
-class ClientModeError(Exception):
-    def __str__(self):
-        return 'Киент запущен с недопустимым режимом выполнения'
+# class ClientModeError(Exception):
+#     def __str__(self):
+#         return 'Клиент запущен с недопустимым режимом выполнения'
+#
+#
+# class ConnectInServerSocketError(Exception):
+#     def __str__(self):
+#         return 'Обнаружена комманда connect при работе с сокетом сервера'
+#
+#
+# class NoTCPConnectionError(Exception):
+#     def __str__(self):
+#         return 'У сокета отсутствует настройка по работе с TCP-соединением'
+#
+#
+# class ListenOrAcceptInClientSocketError(Exception):
+#     def __str__(self):
+#         return 'Обнаружена комманда listen или команда accept при работе с сокетом клиента'
+#
+#
+# class SocketInClassAttributesError(Exception):
+#     def __str__(self):
+#         return 'В атрибутах класса обнаружен объект сокета'
+#
+#
+# class IpAddressError(Exception):
+#     def __str__(self):
+#         return 'Некорректный формат ip-адреса'

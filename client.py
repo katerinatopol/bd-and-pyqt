@@ -1,250 +1,263 @@
-"""Программа-клиент"""
+import re
+import sys
 
 import argparse
-import socket
-import sys
 import logging
+import decos
 import time
-import json
+from datetime import datetime
+import pickle
 import threading
+import socket
+from config import ACTION, PRESENCE, TIME, USER, ACCOUNT_NAME, OK, server_port, server_address, StandartServerCodes, \
+    UnknownCode, MAIN_CHANNEL, SERVER, MSG, TO, FROM, MESSAGE, RESPONSE, account
+from meta import ClientVerifier
 
-import custom_exceptions
-import common.variables as vrs
-import log.client_log_config
-from common.utils import send_message, get_message
-from decos import logger
+# Общая переменная для читателя и писателя сообщений
+# Последний пользователь, писавший в лс:
+last_private_user = ''
 
-LOG = logging.getLogger('client')
-LOG_F = logging.getLogger('client_func')
+# Инициализация логирования клиента
+log = logging.getLogger('Client_log')
+LOGGER = decos.Log(log)
 
 
-class Client:
-    """
-    Класс клиента
-    """
+# Основная функция клиента
+class Client(metaclass=ClientVerifier):
+    global log, LOGGER
 
-    @logger(LOG_F)
-    def __init__(self):
-        """
-        Метод инициализации
-        self.server_port - порт сервера
-        self.server_address - адрес сервера
-        self.client_name - имя клиента
-        self.transport - сокет клиента
-        """
-        self.server_port, self.server_address, self.client_name = self.get_params()
-        self.transport = self.prepare_transport()
+    def __init__(self, serv_address=server_address, serv_port=server_port, action=PRESENCE, mode='f', acc=account):
+        self.serv_address = serv_address
+        self.serv_port = serv_port
+        self.action = action
+        self.mode = mode
+        self.account = acc
+        # Последний пользователь, писавший в лс:
+        self.last_private_user = ''
+        self.alive = True
 
-    @logger(LOG_F)
-    def create_message(self, action, message=None, destination=None):
-        """
-        Метод создания сообщений
-        :param action: тип действия
-        :param message: текст сообщения
-        :param destination: адресат сообщения
-        :return: сообщение в виде словаря
-        """
-        result_message = {
-            vrs.ACTION: action,
-            vrs.TIME: time.time(),
-            vrs.PORT: self.server_port,
-        }
+    # функция создания сообщения в чате
+    @staticmethod
+    def create_message(message_to, text, account_name='Guest'):
+        return {ACTION: MSG, TIME: datetime.today().strftime("%Y-%m-%d-%H.%M.%S"), TO: message_to, FROM: account_name,
+                MESSAGE: text}
 
-        if action == vrs.PRESENCE:
-            result_message[vrs.USER] = {vrs.ACCOUNT_NAME: self.client_name}
+    # функция спец сообщения для пользователя Admin
+    @staticmethod
+    def create_admin_message(text, account_name):
+        return {ACTION: 'Stop server', TIME: datetime.today().strftime("%Y-%m-%d-%H.%M.%S"), TO: SERVER,
+                FROM: account_name, MESSAGE: text}
 
-        elif action == vrs.MESSAGE and message and destination:
-            result_message[vrs.SENDER] = self.client_name
-            result_message[vrs.MESSAGE_TEXT] = message
-            result_message[vrs.DESTINATION] = destination
-
-        elif action == vrs.EXIT:
-            result_message[vrs.ACCOUNT_NAME] = self.client_name
-
-        return result_message
-
-    @logger(LOG_F)
-    def presence_answer(self):
-        """
-        Метод обработки ответа сервера на приветственное сообщение
-        :return: ответ сервера в виде строки
-        """
-        server_message = get_message(self.transport)
-        if vrs.RESPONSE in server_message:
-            if server_message[vrs.RESPONSE] == 200:
-                return '200 : OK'
-            return f'400 : {server_message[vrs.ERROR]}'
-        raise custom_exceptions.NoResponseInServerMessage
-
-    def process_server_message(self):
-        """
-        Метод обработки сообщений с сервера от других клиентов
-        :return: None
-        """
-        while True:
+    # процедура чтения сообщений с сервера
+    def client_reader(self, sock, account_arg):
+        # в цикле опрашиваем сокет на предмет наличия новых сообщений
+        while self.alive:
             try:
-                server_message = get_message(self.transport)
-                if server_message.get(vrs.ACTION) == vrs.MESSAGE and \
-                        vrs.SENDER in server_message and vrs.MESSAGE_TEXT in server_message and \
-                        server_message.get(vrs.DESTINATION) == self.client_name:
-                    LOG.debug(f'{self.client_name}: Получено сообщение от {server_message[vrs.SENDER]}')
-                    print(f'\n<<{server_message[vrs.SENDER]}>> : {server_message[vrs.MESSAGE_TEXT]}')
+                message = pickle.loads(sock.recv(1024))
+                log.info(f'Получено сообщение с сервера: {message}')
+                if message[FROM] == account_arg:
+                    print(message[MESSAGE].replace(f'{account_arg}:> ', '(me)', 1))
                 else:
-                    LOG.debug(f'{self.client_name}: Получено сообщение от сервера о некорректном запросе')
-                    print(f'\nПолучено сообщение от сервера о некорректном запросе: {server_message}')
-            except custom_exceptions.IncorrectData as error:
-                LOG.error(f'Ошибка: {error}')
-            except (OSError, ConnectionError, ConnectionAbortedError,
-                    ConnectionResetError, json.JSONDecodeError):
-                LOG.critical(f'Потеряно соединение с сервером.')
+                    print(f'{message[MESSAGE]}')
+                if message[TO] != MAIN_CHANNEL and re.findall('[^\(private\)]+', message[FROM]):
+                    self.last_private_user = message[FROM]
+            except:
+                if self.alive:
+                    print('Сервер разорвал соединение или получен некорректный ответ! Приложение завершает работу')
+                    log.error('Reader: Сервер разорвал соединение или получен некорректный ответ!')
+                    sock.close()
+                self.alive = False
                 break
+        sys.exit(0)
 
-    @logger(LOG_F)
-    def send_message_to_server(self, to_client, message):
-        """
-        Метод отправки сообщений на сервер для других клиентов
-        :param to_client: адресат
-        :param message: сообщение
-        :return: None
-        """
-        message_to_send = self.create_message(vrs.MESSAGE, message, to_client)
-        try:
-            send_message(self.transport, message_to_send)
-            LOG.info(f'{self.client_name}: Отправлено сообщение для пользователя {to_client}')
-        except Exception:
-            LOG.critical('Потеряно соединение с сервером.')
-            sys.exit(1)
-
-    @logger(LOG_F)
-    def prepare_transport(self):
-        """
-        Метод подготовки сокета клиента
-        :return: сокет клиента
-        """
-        try:
-            transport = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            transport.connect((self.server_address, self.server_port))
-        except ConnectionRefusedError:
-            LOG.critical(f'Не удалось подключиться к серверу {self.server_address}:{self.server_port}')
-            sys.exit(1)
-        return transport
-
-    def user_interactive(self):
-        """
-        Метод взаимодействия клиента с пользователем
-        :return: None
-        """
-        self.print_help()
-        while True:
-            command = input('Введите команду: ')
-            if command == 'message':
-                self.send_message_to_server(*self.input_message())
-            elif command == 'help':
-                self.print_help()
-            elif command == 'exit':
-                send_message(self.transport, self.create_message(vrs.EXIT))
-                print('Завершение соединения.')
-                LOG.info('Завершение работы по команде пользователя.')
-                time.sleep(0.5)
-                break
-            else:
-                print('Команда не распознана, попробойте снова. help - вывести поддерживаемые команды.')
-
-    @logger(LOG_F)
-    def send_presence(self):
-        """
-        Метод отправки приветственного сообщения на сервер.
-        В случае ответа сервера об успешном подключении возвращает True
-        :return: True или False
-        """
-        try:
-            send_message(self.transport, self.create_message(vrs.PRESENCE))
-            answer = self.presence_answer()
-            LOG.info(f'Установлено соединение с сервером. Ответ сервера: {answer}')
-            print(f'Установлено соединение с сервером.')
-            return True if answer == '200 : OK' else False
-        except json.JSONDecodeError:
-            LOG.error('Не удалось декодировать полученную Json строку.')
-            sys.exit(1)
-        except custom_exceptions.NoResponseInServerMessage as error:
-            LOG.error(f'Ошибка сообщения сервера {self.server_address}: {error}')
-
-    def run(self):
-        """
-        Основной метод клиента
-        :return: None
-        """
-        print(self.client_name)
-        if self.send_presence():
-            receiver = threading.Thread(target=self.process_server_message)
-            receiver.daemon = True
-            receiver.start()
-
-            user_interface = threading.Thread(target=self.user_interactive)
-            user_interface.daemon = True
-            user_interface.start()
-            LOG.debug(f'{self.client_name}: Запущены процессы')
-
-            while True:
-                time.sleep(1)
-                if receiver.is_alive() and user_interface.is_alive():
+    # процедура отправки сообщений на сервер
+    def client_writer(self, sock, account_arg):
+        send_to = MAIN_CHANNEL
+        console_prefix = f':> '
+        # в цикле запрашиваем у пользователя ввод нового сообщения
+        while self.alive:
+            message_to_send = ""
+            user_message = input(console_prefix)
+            # Обработка служебных команд пользователя
+            if user_message.startswith('to'):  # выбор получателя для отправки
+                destination = user_message.split()
+                try:
+                    send_to = destination[1]
+                    if destination[1] == 'all':
+                        send_to = MAIN_CHANNEL
+                        console_prefix = f':> '
+                    else:
+                        console_prefix = f'{account_arg} to {destination[1]}:> '
+                    log.debug(f'Получатель установлен на: {send_to}')
                     continue
+                except IndexError:
+                    print('Не задан получатель')
+            if user_message == 'help':
+                print(f'{account_arg}! Для отправки личного сообщения напишите: to имя_получателя')
+                print(
+                    'Для отправки всем напишите to all. Быстрый выбор клиента для ответа на последнее лс r.'
+                    'Для получения списка подключенных клиентов who. Для выхода напишите exit')
+                log.debug('Вывод справки пользователю по команде help')
+                continue
+            if user_message == 'exit':
+                log.info('Пользователь вызвал закрытие клиента - exit')
+                print('Выход из программы..')
+                self.alive = False
+                # sock.close()
+                break
+            if user_message == 'r':
+                if self.last_private_user:
+                    send_to = self.last_private_user
+                    console_prefix = f'{account_arg} to {self.last_private_user}:> '
+                    log.debug(f'Получатель установлен на последнего писавшего в лс: {self.last_private_user}')
+                    continue
+            if user_message == 'who':
+                message_to_send = self.create_message(SERVER, user_message, account_arg)
+                log.debug('Вывод списка пользователей в онлайн - who')
+            if account_arg == 'Admin' and re.findall('^[!]{3} stop', user_message):
+                # Если админ написал !!! stop, то останавливаем сервер
+                message_to_send = self.create_admin_message(user_message, account_arg)
+                log.info(f'Админ послал команду выключения сервера и сообщение {user_message}')
+            elif user_message != 'who':
+                # Формирование обычного сообщения
+                message_to_send = self.create_message(send_to, user_message, account_arg)
+                log.debug('Формирование обычного сообщения')
+
+            # Отправка сообщения
+            try:
+                if self.alive:
+                    sock.send(pickle.dumps(message_to_send))
+                    log.info(f'Отправлено сообщение на сервер: {message_to_send}')
+                else:
+                    break
+            except:
+                if self.alive:
+                    print('Сервер разорвал соединение! Приложение завершает работу')
+                    log.error('Writer: Сервер разорвал соединение!')
+                    sock.close()
+                self.alive = False
                 break
 
-    @staticmethod
-    @logger(LOG_F)
-    def print_help():
-        """
-        Метод, выводящий справку по использованию
-        """
-        print('Поддерживаемые команды:')
-        print('message - отправить сообщение. Кому и текст будет запрошены отдельно.')
-        print('help - вывести подсказки по командам')
-        print('exit - выход из программы')
+    @LOGGER
+    def create_presence_message(self, account_name, action=PRESENCE):
+        log.debug('Формирование приветственного сообщения')
 
-    @staticmethod
-    @logger(LOG_F)
-    def input_message():
-        """
-        Метод для получения адресата и сообщения от пользователя
-        :return: кортеж строк
-        """
-        while True:
-            to_client = input('Введите имя пользователя-адресата:')
-            message = input('Введите сообщение:')
-            if to_client.strip() and message.strip():
-                break
-            else:
-                print('Имя пользователя и сообщение не может быть пустым!')
-        return to_client, message
+        # Проверка параметров на соответствие протоколу
+        if len(account_name) > 25:
+            log.error('Имя пользователя более 25 символов!')
+            raise ValueError
 
-    @staticmethod
-    @logger(LOG_F)
-    def get_params():
-        """
-        Метод получения параметров при запуске из комадной строки
-        :return: кортеж параметров
-        """
-        parser = argparse.ArgumentParser()
-        parser.add_argument('port', nargs='?', type=int, default=vrs.DEFAULT_PORT)
-        parser.add_argument('address', nargs='?', type=str, default=vrs.DEFAULT_IP_ADDRESS)
-        parser.add_argument('-n', '--name', type=str, default='Guest')
+        if not isinstance(account_name, str):
+            log.error('Полученное имя пользователя не является строкой символов')
+            raise TypeError
 
-        args = parser.parse_args()
+        # Приветственное сообщение
+        message = {
+            ACTION: action,
+            TIME: datetime.today().strftime("%Y-%m-%d-%H.%M.%S"),
+            USER: {
+                ACCOUNT_NAME: account_name,
+                'account_password': 123
+            }
+        }
+        return message
 
-        server_port = args.port
-        server_address = args.address
-        client_name = args.name
+    @LOGGER
+    def start_client(self):
+        log.info('Запуск клиента')
+        print('<<< Console IM >>>')
+        # Если имя аккаунта не передано, то спросим
+        if len(sys.argv) < 3 and self.account == account:
+            self.account = input('Введите имя аккаунта: ')
+            if len(self.account) == 0:  # Если пустой ввод, то имя по-умолчанию
+                self.account = 'Guest'
 
-        try:
-            if not (1024 < server_port < 65535):
-                raise custom_exceptions.PortOutOfRange
-        except custom_exceptions.PortOutOfRange as error:
-            LOG.critical(f'Ошибка порта {server_port}: {error}. Соединение закрывается.')
-            sys.exit(1)
-        return server_port, server_address, client_name
+        print(f'Здравствуйте {self.account}!')
+        # Создаем сокет для общения с сервером
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+
+            if not isinstance(self.serv_address, str) or not isinstance(self.serv_port, int):
+                log.error('Полученный адрес сервера или порт не является строкой или числом!')
+                raise ValueError
+
+            # установка связи с сервером
+            try:
+                if self.serv_address == '0.0.0.0':
+                    self.serv_address = 'localhost'
+                log.info(f' Попытка подключения к {self.serv_address} {self.serv_port}')
+                s.connect((self.serv_address, self.serv_port))
+            except Exception as e:
+                print('Ошибка подключения:', e)
+                log.error(f'Ошибка подключения: {e}')
+                raise
+
+            # создание приветственного сообщения для сервера
+            message = self.create_presence_message(self.account, self.action)
+
+            if isinstance(message, dict):
+                data_bytes = pickle.dumps(message)
+                log.debug(f'Отправляю приветственное сообщение "{message}" на сервер')
+                s.send(data_bytes)
+                log.debug('и жду ответа')
+                server_response = pickle.loads(s.recv(1024))
+                log.debug(f'Ответ: {server_response}')
+                # Если сервер ответил нестандартным кодом, то завершаем работу
+                if server_response.get(RESPONSE) not in StandartServerCodes:
+                    log.error(f'Неизвестный код ответа от сервера: {server_response.get(RESPONSE)}')
+                    raise UnknownCode(server_response.get(RESPONSE))
+                # Если все хорошо, то переключаем режим клиента в переданный в параметре
+                # или оставляем по-умолчанию - полный
+                if server_response.get('response') == OK:
+                    print('Соединение установлено!')
+                    log.info('Авторизация успешна. Соединение установлено!')
+                    if self.mode == 'r':
+                        print('Клиент в режиме чтения')
+                        log.debug('Клиент в режиме чтения')
+                        self.client_reader(s, self.account)
+                    elif self.mode == 'w':
+                        print('Клиент в режиме записи')
+                        log.debug('Клиент в режиме записи')
+                        self.client_writer(s, self.account)
+                    elif self.mode == 'f':
+                        log.debug('Клиент в полнофункциональном режиме')
+                        print(f'Отправка сообщений всем пользователям в канал {MAIN_CHANNEL}')
+                        print('Для получения помощи наберите help')
+                        # читаем сообщения в отдельном потоке
+                        read_thread = threading.Thread(target=self.client_reader, args=(s, self.account))
+                        read_thread.daemon = True
+                        read_thread.start()
+                        write_thread = threading.Thread(target=self.client_writer, args=(s, self.account))
+                        write_thread.daemon = True
+                        write_thread.start()
+
+                        while self.alive:
+                            time.sleep(1)
+                            continue
+                    else:
+                        s.close()
+                        raise Exception('Не верный режим клиента')
+                else:
+                    log.error('Что-то пошло не так..')
+        s.close()
+        exit(0)
 
 
-if __name__ == '__main__':
-    client = Client()
-    client.run()
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-p', '--port', type=int, help='Port server', default=server_port)
+    parser.add_argument('-a', '--address', type=str, help='Address server', default=server_address)
+    parser.add_argument('-u', '--user', type=str, help='User name', default='Guest')
+    parser.add_argument('-m', '--mode', type=str, help='r - режим чтения,'
+                                                       'w - написать сообщение,'
+                                                       'f - полный режим', default='f')
+
+    args = parser.parse_args()
+
+    server_port = args.port
+    server_address = args.address
+    user_name = args.user
+    mode_current = args.mode
+
+    # запуск основного кода клиента
+    c = Client(acc='Simper', mode=mode_current)
+    c.start_client()

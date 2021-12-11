@@ -1,15 +1,26 @@
-import logging
-import log.server_log_config
-import log.client_log_config
-import sys
-
-LOGGER_NAME = sys.argv[0].split('.')[0]
-LOGGER = logging.getLogger(LOGGER_NAME)
+import time
+import traceback
+from functools import wraps
 
 
-def logger(func):
-    def my_logger(*args, **kwargs):
-        result = func(*args, **kwargs)
-        LOGGER.debug(f'Имя вызываемой функции: {func.__name__}; параметры: {args}, {kwargs}.')
-        return result
-    return my_logger
+class Log:
+    def __init__(self, logger):
+        self.logger = logger
+
+    def __call__(self, func):
+        @wraps(func)
+        def deco_log_call(*args, **kwargs):
+            res = func(*args, **kwargs)
+            message = f'{time.asctime()} Вызван декоратор {Log.__name__} для {func.__name__}'
+            if args or kwargs:
+                message += ' с параметрами'
+            if args:
+                message += f' {args}'
+            if kwargs:
+                message += f' {kwargs}'
+            message += f' из функции {traceback.format_stack()[0].strip().split()[-1]}'
+            print(message)
+            self.logger.info(message)
+            return res
+
+        return deco_log_call
