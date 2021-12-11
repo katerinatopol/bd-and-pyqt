@@ -1,193 +1,204 @@
-"""Программа-сервер"""
-
-import argparse
 import logging
-import sys
 import select
-import time
-from collections import deque
-from socket import socket, AF_INET, SOCK_STREAM
+import sys
+from config import ACTION, PRESENCE, TIME, RESPONSE, OK, WRONG_REQUEST, \
+    ERROR, server_port, server_address, FROM, SHUTDOWN, \
+    MSG, TO, MESSAGE, SERVER, MAIN_CHANNEL, UNKNOWN_ERROR
+import socket
+import decos
+import argparse
+import pickle
+from log import server_log_config
+from descriptors import SockVerify
+from meta import ServerVerifier
 
-# project modules imports
-import common.variables as vrs
-import custom_exceptions
-import log.server_log_config
-from decos import logger
-from common.utils import get_message, send_message
+log = logging.getLogger('Server_log')
+logger = decos.Log(log)
 
 
-LOG = logging.getLogger('server')
-LOG_F = logging.getLogger('server_func')
+class ServerSocket(socket.socket):
+    port = SockVerify()
+    address = SockVerify()
+
+    def __init__(self, p_addr='0.0.0.0', p_port=7777):
+        super().__init__()
+        self.address = p_addr
+        self.port = p_port
+        self.bind((self.address, self.port))
+        self.listen(1)
+        self.settimeout(0.1)
 
 
-class Server:
-    """
-    Класс сервера
-    """
+class Server(metaclass=ServerVerifier):
+    global log, logger
+    # Список сокетов клиентов и словарь аккаунтов клиентов с информацией о сокете
+    clients = []
+    names = {}
+    alive = True
 
-    RESPONSES = {
-        'OK': {vrs.RESPONSE: 200},
-        'BAD_REQUEST': {vrs.RESPONSE: 400, vrs.ERROR: 'Bad Request'}
-    }
+    def __init__(self, serv_addr=server_address, serv_port=server_port):
+        self.serv_addr = serv_addr
+        self.serv_port = serv_port
 
-    @logger(LOG_F)
-    def __init__(self):
-        """
-        Метод инициализации
-        self.clients_names - словарь зарегистрированых пользователей
-        self.clients_list - список подключённых пользователей
-        self.messages_deque - очередь сообщений пользователей
-        self.receive_data_list - список сокетов на получение
-        self.send_data_list - список сокетов на отправку
-        self.errors_list - список сокетов с ошибками
-        self.listen_port - прослушиваемый порт
-        self.listen_address - прослушиваемый адрес
-        self.transport - сокет сервера
-        """
-        self.clients_names = dict()
-        self.clients_list = []
-        self.messages_deque = deque()
-        self.receive_data_list = []
-        self.send_data_list = []
-        self.errors_list = []
-        self.listen_port, self.listen_address = self.get_params()
-        self.transport = self.prepare_socket()
-        LOG.debug(f'Создан объект сервера')
-
-    @logger(LOG_F)
-    def prepare_socket(self):
-        """
-        Метод подготовки и запуска сокета сервера
-        :return: сокет сервера
-        """
-        transport = socket(AF_INET, SOCK_STREAM)
-        transport.bind((self.listen_address, self.listen_port))
-        transport.settimeout(1)
-        transport.listen(vrs.MAX_CONNECTIONS)
-        LOG.info(f'Запущен сервер. Порт подключений: {self.listen_port}, адрес прослушивания: {self.listen_address}')
-        return transport
-
-    @logger(LOG_F)
-    def process_client_message(self, message, client):
-        """
-        Метод обработки сообщений клиентов
-        :param message: сообщение клиента
-        :param client: сокет клиента
-        :return: None
-        """
-        if message.get(vrs.ACTION) == vrs.PRESENCE and vrs.USER in message and \
-                vrs.TIME in message and vrs.PORT in message:
-            client_name = message[vrs.USER][vrs.ACCOUNT_NAME]
-            if client_name not in self.clients_names:
-                self.clients_names[client_name] = client
-                send_message(client, self.RESPONSES.get('OK'))
-                LOG.debug(f'Клиент {client_name} зарегестрирован на сервере')
-            else:
-                response = self.RESPONSES['BAD_REQUEST']
-                response[vrs.ERROR] = f'Имя пользователя {client_name} уже занято.'
-                send_message(client, response)
-                self.clients_list.remove(client)
-                client.close()
-                LOG.error(f'Имя пользователя {client_name} уже занято. Клиент отключён.')
-            return
-
-        if message.get(vrs.ACTION) == vrs.MESSAGE and vrs.MESSAGE_TEXT in message and \
-                vrs.SENDER in message and vrs.DESTINATION in message and \
-                message.get(vrs.DESTINATION) in self.clients_names:
-            self.messages_deque.append(message)
-            LOG.debug(f'Сообщение клиента {message[vrs.SENDER]} '
-                      f'для клиента {message[vrs.DESTINATION]} добавлено в очередь сообщений')
-            return
-
-        if message.get(vrs.ACTION) == vrs.EXIT and vrs.ACCOUNT_NAME in message:
-            self.clients_list.remove(self.clients_names[message[vrs.ACCOUNT_NAME]])
-            self.clients_names[message[vrs.ACCOUNT_NAME]].close()
-            LOG.debug(f'Клиент {message[vrs.ACCOUNT_NAME]} вышел из чата. Клиент отключён от сервера.')
-            del self.clients_names[message[vrs.ACCOUNT_NAME]]
-            return
-
-        send_message(client, self.RESPONSES.get('BAD_REQUEST'))
-        return
-
-    def received_messages_processing(self):
-        """
-        Метод получения сообщений от сокетов клиентов
-        :return: None
-        """
-        for client_with_message in self.receive_data_list:
-            try:
-                self.process_client_message(get_message(client_with_message), client_with_message)
-            except Exception:
-                LOG.info(f'Клиент {client_with_message.getpeername()} отключился от сервера.')
-                self.clients_list.remove(client_with_message)
-
-    @logger(LOG_F)
-    def send_messages_to_clients(self):
-        """
-        Метод отправки сообщений клиентам
-        :return: None
-        """
-        while self.messages_deque:
-            message = self.messages_deque.popleft()
-            waiting_client = self.clients_names[message[vrs.DESTINATION]]
-            if waiting_client in self.send_data_list:
+    # Функция чтения сообщений с сокетов клиентов
+    def read_messages(self, from_clients, client_list):
+        # список всех полученных сообщений
+        message_list = []
+        for connection in from_clients:
+            if self.alive:
                 try:
-                    send_message(waiting_client, message)
-                    LOG.info(f'Сообщение клиента {message[vrs.SENDER]} отправлено клиенту {message[vrs.DESTINATION]}')
-                except Exception:
-                    LOG.info(f'Клиент {waiting_client.getpeername()} отключился от сервера.')
-                    waiting_client.close()
-                    self.clients_list.remove(waiting_client)
+                    data_bytes = connection.recv(1024)  # принимаем данные от клиента, по 1024 байт
+                    client_message = pickle.loads(data_bytes)  # Преобразование строки JSON в объекты Python
+                    log.info(f'Принято сообщение от клиента: {client_message[FROM]}')
+                    log.debug(f'{client_message}')
+                    # Если спец сообщение от Admin, то вырубаем сервер
+                    if ACTION in client_message and \
+                            client_message[ACTION] == 'Stop server' and \
+                            client_message[FROM] == 'Admin':
+                        log.info(f'Получена команда выключения сервера, ответ: {RESPONSE}: {SHUTDOWN}')
+                        self.alive = False
+                        # return {RESPONSE: SHUTDOWN}
+                    message_list.append((client_message, connection))
+                except:
+                    log.debug(
+                        f'Клиент {connection.fileno()} {connection.getpeername()} '
+                        f'отключился до передачи сообщения по таймауту')
+                    self.names = {key: val for key, val in self.names.items() if val != connection}
+                    client_list.remove(connection)
+        return message_list
 
-    def run(self):
-        """
-        Основной метод сервера
-        :return: None
-        """
-        while True:
+    # Функция записи сообщений в сокеты клиентов
+    def write_messages(self, messages, to_clients, client_list):
+        for message, sender in messages:
+            if self.alive:
+                # Если приватный канал, то отправка только одному получателю
+                if message[ACTION] == MSG and message[TO] != MAIN_CHANNEL and message[TO] != message[FROM]:
+                    # получаем пользователя, которому отправляем сообщение
+                    to = message[TO]
+                    # обработка сервером команды who
+                    if message[MESSAGE] != 'who':
+                        message[MESSAGE] = f'(private){message[FROM]}:> {message[MESSAGE]}'
+                    try:
+                        connection = self.names[to]
+                    except:
+                        connection = self.names[message[FROM]]
+                        if message[TO] == SERVER and message[MESSAGE] == 'who':
+                            message[TO] = message[FROM]
+                            client_names = [key for key in self.names.keys()]
+                            message[MESSAGE] = f'<:SERVER:> Список клиентов в онлайн: {client_names}'
+                            log.debug(
+                                f'Пользователем {message[FROM]} запрошен список пользователей онлайн: '
+                                f'{message[MESSAGE]}')
+                        else:
+                            message[TO] = message[FROM]
+                            message[FROM] = SERVER
+                            message[MESSAGE] = f'<:SERVER:> Клиент {to} не подключен. Отправка сообщения не возможна!'
+                            log.warning(message)
+                    # отправка сообщения
+                    try:
+                        data_bytes = pickle.dumps(message)  # Преобразование объекта Python в строку JSON
+                        connection.send(data_bytes)
+                    except:
+                        log.warning(
+                            f'Сокет клиента {connection.fileno()} {connection.getpeername()} '
+                            f'недоступен для отправки. Вероятно он отключился')
+                        self.names = {key: val for key, val in self.names.items() if val != connection}
+                        connection.close()
+                        client_list.remove(connection)
+                # если общий канал, то отправка сообщения всем клиентам
+                elif message[ACTION] == MSG and message[TO] == MAIN_CHANNEL:
+                    message[MESSAGE] = f'{message[FROM]}:> {message[MESSAGE]}'
+                    for connection in to_clients:
+                        # отправка сообщения
+                        try:
+                            data_bytes = pickle.dumps(message)  # Преобразование объекта Python в строку JSON
+                            connection.send(data_bytes)
+                        except:
+                            log.warning(
+                                f'Сокет клиента {connection.fileno()} {connection.getpeername()} '
+                                f'недоступен для отправки. Вероятно он отключился')
+                            self.names = {key: val for key, val in self.names.items() if val != connection}
+                            connection.close()
+                            client_list.remove(connection)
+
+    # Функция проверки корректности приветственного сообщения и формирования ответа
+    @logger
+    def check_correct_presence_and_response(self, presence_message):
+        log.debug('Запуск ф-ии проверки корректности запроса')
+        if ACTION in presence_message and presence_message[ACTION] == 'Unknown':
+            return {RESPONSE: UNKNOWN_ERROR}
+        elif ACTION in presence_message and \
+                presence_message[ACTION] == PRESENCE and \
+                TIME in presence_message and \
+                isinstance(presence_message[TIME], str):
+            # Если всё хорошо шлем ОК
+            log.debug(f'Проверка успешна, ответ: {RESPONSE}: {OK}')
+            return {RESPONSE: OK}
+        else:
+            # Иначе шлем код ошибки
+            log.warning(f'{RESPONSE}: {WRONG_REQUEST}, {ERROR}: "Не верный запрос"')
+            return {RESPONSE: WRONG_REQUEST, ERROR: 'Не верный запрос'}
+
+    @logger
+    def start_server(self):
+
+        # создаем сокет для работы с клиентами
+        s = ServerSocket(self.serv_addr, self.serv_port)
+
+        log.info('Запуск сервера! Готов к приему клиентов! \n')
+        while self.alive:
             try:
-                client, client_address = self.transport.accept()
-            except OSError:
+                # Прием запросов на подключение, проверка приветственного сообщения и ответ
+                client, address = s.accept()
+                log.info(f'Получен запрос на соединение от {address[0]}:{address[1]}')
+                # print(client, address)
+                data_bytes = client.recv(1024)  # принимаем данные от клиента, по 1024 байт
+                client_message = pickle.loads(data_bytes)  # Преобразование строки JSON в объекты Python
+                log.info(f'Принято сообщение от клиента: {client_message}')
+                answer = self.check_correct_presence_and_response(client_message)
+                client_name = client_message.get('user').get('account_name')
+                log.info(f"Приветствуем пользователя {client_name}!")
+                log.info(f'Отправка ответа клиенту: {answer}')
+                data_bytes = pickle.dumps(answer)  # Преобразование объекта Python в строку JSON
+                client.send(data_bytes)
+            except OSError as e:
+                log.debug(f'За время socket timeout не было подключений: {e}')
                 pass
             else:
-                LOG.info(f'Установлено соедение с клиентом {client_address}')
-                self.clients_list.append(client)
-
-            self.receive_data_list = []
-            self.send_data_list = []
-            self.errors_list = []
+                self.names[client_name] = client
+                self.clients.append(client)
+            finally:
+                r = []
+                w = []
+                e = []
+                select_timeout = 0
             try:
-                if self.clients_list:
-                    self.receive_data_list, self.send_data_list, self.errors_list = \
-                        select.select(self.clients_list, self.clients_list, [], 0)
-            except OSError:
+                r, w, e = select.select(self.clients, self.clients, e, select_timeout)
+            except:
+                # исключение в случае отключения любого из клиентов
                 pass
 
-            self.received_messages_processing()
+            req = self.read_messages(r, self.clients)
+            self.write_messages(req, w, self.clients)
 
-            if self.messages_deque and self.send_data_list:
-                self.send_messages_to_clients()
-
-    @staticmethod
-    @logger(LOG_F)
-    def get_params():
-        """
-        Метод получения параметров при запуске из комадной строки
-        :return: кортеж параметров
-        """
-        parser = argparse.ArgumentParser()
-        parser.add_argument('-p', type=int, default=vrs.DEFAULT_PORT)
-        parser.add_argument('-a', type=str, default='')
-        args = parser.parse_args()
-        try:
-            if not (1024 < args.p < 65535):
-                raise custom_exceptions.PortOutOfRange
-        except custom_exceptions.PortOutOfRange as error:
-            LOG.critical(f'Ошибка порта {args.p}: {error}. Соединение закрывается.')
-            sys.exit(1)
-        return args.p, args.a
+        s.close()
+        exit(0)
 
 
-if __name__ == '__main__':
-    server = Server()
-    server.run()
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-p', '--port', type=int, help='Port server', default=server_port)
+    parser.add_argument('-a', '--address', type=str, help='Address server', default=server_address)
+    args = parser.parse_args()
+
+    server_port = args.port
+    server_address = args.address
+
+    # Показывать лог в консоль при запуске сервера напрямую
+    server_stream_handler = logging.StreamHandler(sys.stdout)
+    server_stream_handler.setLevel(logging.DEBUG)
+    server_stream_handler.setFormatter(server_config_log.log_format)
+    log.addHandler(server_stream_handler)
+
+    my_server = Server(server_address, server_port)
+    my_server.start_server()
